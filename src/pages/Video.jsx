@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { io } from "socket.io-client";
 
 const BACKEND = import.meta.env.DEV ? "http://localhost:5000" : window.location.origin;
@@ -17,13 +17,21 @@ export default function VideoPage() {
   const streamRef  = useRef(null);
   const socketRef  = useRef(null);
   const roomRef    = useRef("");
-  const isHostRef  = useRef(false); // true = created the offer
+  const remoteStreamRef = useRef(new MediaStream());
 
   useEffect(() => () => cleanup(), []);
+
+  // Keep remoteRef in sync whenever it mounts
+  useEffect(() => {
+    if (remoteRef.current) {
+      remoteRef.current.srcObject = remoteStreamRef.current;
+    }
+  });
 
   const cleanup = () => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
+    remoteStreamRef.current = new MediaStream();
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (socketRef.current) {
       if (roomRef.current) socketRef.current.emit("leave", { room: roomRef.current });
@@ -31,7 +39,6 @@ export default function VideoPage() {
       socketRef.current = null;
     }
     roomRef.current = "";
-    isHostRef.current = false;
   };
 
   const enableCamera = async () => {
@@ -51,40 +58,46 @@ export default function VideoPage() {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "turn:openrelay.metered.ca:80",        username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443",       username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:80",                  username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443",                 username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443?transport=tcp",   username: "openrelayproject", credential: "openrelayproject" },
       ],
     });
 
-    // Add all local tracks BEFORE creating offer/answer
+    // Add local tracks
     streamRef.current.getTracks().forEach(track => {
       pc.addTrack(track, streamRef.current);
     });
+
+    // ── KEY FIX: add each incoming track directly to remoteStream ──
+    pc.ontrack = (e) => {
+      console.log("ontrack:", e.track.kind);
+      e.streams[0].getTracks().forEach(track => {
+        remoteStreamRef.current.addTrack(track);
+      });
+      // Force the video element to use the stream
+      if (remoteRef.current) {
+        remoteRef.current.srcObject = remoteStreamRef.current;
+        remoteRef.current.play().catch(() => {});
+      }
+      setCallState("connected");
+      setStatusMsg("Connected.");
+    };
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) socket.emit("signal", { room, type: "candidate", candidate });
     };
 
-    pc.ontrack = (e) => {
-      console.log("ontrack fired", e.streams);
-      if (remoteRef.current && e.streams[0]) {
-        remoteRef.current.srcObject = e.streams[0];
-        setCallState("connected");
-        setStatusMsg("Connected.");
-      }
-    };
-
     pc.onconnectionstatechange = () => {
       console.log("connectionState:", pc.connectionState);
-      if (pc.connectionState === "connected") {
-        setCallState("connected");
-        setStatusMsg("Connected.");
-      }
       if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
         setStatusMsg("Connection lost.");
         setCallState("ended");
       }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log("iceState:", pc.iceConnectionState);
     };
 
     return pc;
@@ -99,6 +112,9 @@ export default function VideoPage() {
     setCallState("calling");
     setStatusMsg(`Joining room ${id}…`);
 
+    // Reset remote stream for fresh call
+    remoteStreamRef.current = new MediaStream();
+
     const socket = io(BACKEND, { transports: ["websocket"] });
     socketRef.current = socket;
 
@@ -107,27 +123,22 @@ export default function VideoPage() {
       setCallState("ended");
     });
 
-    // ── Someone else is already in the room → we are the GUEST → wait for offer
-    // ── We are first in the room → we are the HOST → wait for peer-joined then send offer
-
+    // ── We were first → peer joined → we are HOST → send offer ──
     socket.on("peer-joined", async () => {
-      // We were already in the room, new person joined → WE send the offer
-      console.log("peer-joined: I am host, creating offer");
-      isHostRef.current = true;
+      console.log("I am host — sending offer");
       const pc = makePC(socket, id);
       pcRef.current = pc;
-
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
       socket.emit("signal", { room: id, type: "offer", sdp: offer.sdp });
-      setStatusMsg("Peer joined — connecting…");
     });
 
     socket.on("signal", async (m) => {
-      console.log("signal received:", m.type);
+      console.log("signal:", m.type);
 
-      // Guest receives offer → create answer
+      // ── We arrived second → got offer → we are GUEST → send answer ──
       if (m.type === "offer") {
+        console.log("I am guest — sending answer");
         const pc = makePC(socket, id);
         pcRef.current = pc;
         await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: m.sdp }));
@@ -136,14 +147,16 @@ export default function VideoPage() {
         socket.emit("signal", { room: id, type: "answer", sdp: answer.sdp });
       }
 
-      // Host receives answer
       if (m.type === "answer" && pcRef.current) {
-        await pcRef.current.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: m.sdp }));
+        await pcRef.current.setRemoteDescription(
+          new RTCSessionDescription({ type: "answer", sdp: m.sdp })
+        );
       }
 
-      // Both sides add ICE candidates
       if (m.type === "candidate" && pcRef.current) {
-        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(m.candidate)); } catch(e) { console.warn(e); }
+        try {
+          await pcRef.current.addIceCandidate(new RTCIceCandidate(m.candidate));
+        } catch (e) { console.warn("ICE error", e); }
       }
     });
 
@@ -152,7 +165,6 @@ export default function VideoPage() {
       setCallState("ended");
     });
 
-    // Join the room — server will fire "peer-joined" to whoever was already there
     socket.emit("join", { room: id });
     setStatusMsg(`Room ${id} — waiting for someone to join…`);
   };
