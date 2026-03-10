@@ -1,48 +1,61 @@
-from flask import Flask, jsonify
+import os
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, leave_room, emit
 
-app = Flask(__name__)
-CORS(app)
+# Vite builds to ../dist (one level up from backend/)
+DIST_DIR = os.path.join(os.path.dirname(__file__), "..", "dist")
 
-@app.route("/")
-def home():
-    return "SilentTalk backend running."
+app = Flask(__name__, static_folder=DIST_DIR, static_url_path="/")
+CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ─── Serve React frontend ─────────────────────────────────────
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    full = os.path.join(DIST_DIR, path)
+    if path and os.path.exists(full):
+        return send_from_directory(DIST_DIR, path)
+    return send_from_directory(DIST_DIR, "index.html")
+
+# ─── Voice route ──────────────────────────────────────────────
 
 @app.route("/voice")
 def voice():
-    """
-    Returns demo data. To enable real Hindi voice recognition,
-    uncomment the block below and install:
-      pip install SpeechRecognition pyaudio
-    """
-
-    # -- REAL VOICE (uncomment to enable) --
-    # import speech_recognition as sr, re
-    #
-    # def extract(text):
-    #     d = {}
-    #     m = re.search(r"नाम\s+(.+?)\s+है", text)
-    #     if m: d["name"] = m.group(1)
-    #     m = re.search(r"(\d+)\s*साल", text)
-    #     if m: d["age"] = int(m.group(1))
-    #     m = re.search(r"(\d+)\s*किलो", text)
-    #     if m: d["weight"] = int(m.group(1))
-    #     return d
-    #
-    # r = sr.Recognizer()
-    # with sr.Microphone() as src:
-    #     r.adjust_for_ambient_noise(src)
-    #     audio = r.listen(src, timeout=8)
-    # try:
-    #     text = r.recognize_google(audio, language="hi-IN")
-    #     return jsonify({"text": text, "data": extract(text)})
-    # except Exception as e:
-    #     return jsonify({"text": "Could not understand", "data": {}, "error": str(e)}), 400
-
     return jsonify({
         "text": "मेरा नाम Azhan है, मेरी उम्र 25 साल है, मेरा वजन 70 किलो है",
         "data": {"name": "Azhan", "age": 25, "weight": 70}
     })
 
+# ─── WebSocket signaling ──────────────────────────────────────
+
+@socketio.on("join")
+def on_join(data):
+    room = data.get("room", "").strip().upper()
+    if not room:
+        return
+    join_room(room)
+    emit("peer-joined", {"room": room}, to=room, skip_sid=request.sid)
+
+@socketio.on("signal")
+def on_signal(data):
+    room = data.get("room", "").strip().upper()
+    if not room:
+        return
+    emit("signal", data, to=room, skip_sid=request.sid)
+
+@socketio.on("leave")
+def on_leave(data):
+    room = data.get("room", "").strip().upper()
+    if not room:
+        return
+    leave_room(room)
+    emit("peer-left", {"room": room}, to=room, skip_sid=request.sid)
+
+# ─── Entry point ──────────────────────────────────────────────
+
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)

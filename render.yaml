@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: silenttalk
+    runtime: python
+    buildCommand: "pip install -r backend/requirements.txt && npm install && npm run build"
+    startCommand: "python backend/app.py"
+    envVars:
+      - key: VITE_BACKEND_URL
+        value: ""   # leave blank — frontend and backend share the same URL

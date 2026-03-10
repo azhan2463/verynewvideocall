@@ -1,4 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { io } from "socket.io-client";
+
+// ── Point this at your deployed backend (or localhost for dev) ──
+const BACKEND = import.meta.env.DEV ? "http://localhost:5000" : window.location.origin;
 
 export default function VideoPage() {
   const [inputId, setInputId]       = useState("");
@@ -8,23 +12,37 @@ export default function VideoPage() {
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [statusMsg, setStatusMsg]   = useState("");
 
-  const localRef  = useRef(null);
-  const remoteRef = useRef(null);
-  const pcRef     = useRef(null);
-  const streamRef = useRef(null);
+  const localRef   = useRef(null);
+  const remoteRef  = useRef(null);
+  const pcRef      = useRef(null);
+  const streamRef  = useRef(null);
+  const socketRef  = useRef(null);
+  const roomRef    = useRef("");
 
+  // Cleanup everything on unmount
   useEffect(() => () => cleanup(), []);
 
   const cleanup = () => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
+
     if (pcRef.current) {
-      pcRef.current._ch?.close();
       pcRef.current.close();
       pcRef.current = null;
     }
+
+    if (socketRef.current) {
+      if (roomRef.current) {
+        socketRef.current.emit("leave", { room: roomRef.current });
+      }
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+
+    roomRef.current = "";
   };
 
+  // ── Step 1: turn on camera ──────────────────────────────────
   const enableCamera = async () => {
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -37,14 +55,26 @@ export default function VideoPage() {
     }
   };
 
-  const createPC = useCallback(() => {
+  // ── Create RTCPeerConnection ────────────────────────────────
+  const createPC = useCallback((socket, room) => {
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-      ]
+      ],
     });
+
+    // Attach local tracks
     streamRef.current?.getTracks().forEach(t => pc.addTrack(t, streamRef.current));
+
+    // Send ICE candidates to peer via server
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        socket.emit("signal", { room, type: "candidate", candidate });
+      }
+    };
+
+    // Show remote video when tracks arrive
     pc.ontrack = ({ streams }) => {
       if (remoteRef.current && streams[0]) {
         remoteRef.current.srcObject = streams[0];
@@ -52,66 +82,93 @@ export default function VideoPage() {
         setStatusMsg("Connected.");
       }
     };
+
     pc.oniceconnectionstatechange = () => {
-      if (["disconnected","failed"].includes(pc.iceConnectionState)) {
+      if (["disconnected", "failed"].includes(pc.iceConnectionState)) {
         setStatusMsg("Connection lost.");
         setCallState("ended");
       }
     };
+
     return pc;
   }, []);
 
+  // ── Step 2: join room ───────────────────────────────────────
   const joinRoom = async () => {
     const id = inputId.trim().toUpperCase();
     if (!id) { setStatusMsg("Please enter a room ID."); return; }
+
     setRoomId(id);
+    roomRef.current = id;
     setCallState("calling");
     setStatusMsg(`Joining room ${id}…`);
 
-    const pc = createPC();
-    pcRef.current = pc;
-    const ch = new BroadcastChannel(`silenttalk-${id}`);
-    pc._ch = ch;
+    // Connect socket
+    const socket = io(BACKEND, { transports: ["websocket"] });
+    socketRef.current = socket;
 
-    pc.onicecandidate = ({ candidate }) => {
-      if (candidate) ch.postMessage({ type: "candidate", candidate });
-    };
+    socket.on("connect", () => {
+      socket.emit("join", { room: id });
+    });
 
-    ch.onmessage = async ({ data: m }) => {
-      if (!m) return;
+    socket.on("connect_error", () => {
+      setStatusMsg("Cannot reach signaling server. Is the backend running?");
+      setCallState("ended");
+    });
+
+    // ── Signaling message handler ──
+    socket.on("signal", async (m) => {
+      const pc = pcRef.current;
+      if (!pc || !m) return;
+
       if (m.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(m.offer));
+        await pc.setRemoteDescription(new RTCSessionDescription(m));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        ch.postMessage({ type: "answer", answer });
+        socket.emit("signal", { room: id, ...answer });
         setCallState("connected");
         setStatusMsg("Connected.");
       }
+
       if (m.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(m.answer));
+        await pc.setRemoteDescription(new RTCSessionDescription(m));
         setCallState("connected");
         setStatusMsg("Connected.");
       }
+
       if (m.type === "candidate") {
         try { await pc.addIceCandidate(new RTCIceCandidate(m.candidate)); } catch {}
       }
-      if (m.type === "bye") {
-        setStatusMsg("The other participant left.");
-        setCallState("ended");
-      }
-    };
+    });
 
-    await new Promise(r => setTimeout(r, 600));
-    if (pc.signalingState === "stable" && !pc.remoteDescription) {
+    // Peer left
+    socket.on("peer-left", () => {
+      setStatusMsg("The other participant left.");
+      setCallState("ended");
+    });
+
+    // ── If a peer is already in the room, server fires "peer-joined" back
+    //    to the *existing* peer. We are the newcomer, so we wait for an offer.
+    //    The existing peer sends us an offer when they see "peer-joined".
+    socket.on("peer-joined", async () => {
+      // We are the host — create offer for the new joiner
+      const pc = createPC(socket, id);
+      pcRef.current = pc;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      ch.postMessage({ type: "offer", offer });
-      setStatusMsg(`Room ${id} — waiting for someone to join…`);
-    }
+      socket.emit("signal", { room: id, ...offer });
+      setStatusMsg(`Room ${id} — peer joined, connecting…`);
+    });
+
+    // Create PC now (as potential answerer)
+    const pc = createPC(socket, id);
+    pcRef.current = pc;
+
+    setStatusMsg(`Room ${id} — waiting for someone to join…`);
   };
 
+  // ── Hang up ─────────────────────────────────────────────────
   const hangUp = () => {
-    pcRef.current?._ch?.postMessage({ type: "bye" });
     cleanup();
     setCallState("idle");
     setRoomId(""); setInputId(""); setStatusMsg("");
@@ -119,15 +176,16 @@ export default function VideoPage() {
   };
 
   const toggleMute = () => {
-    streamRef.current?.getAudioTracks().forEach(t => t.enabled = isMuted);
+    streamRef.current?.getAudioTracks().forEach(t => { t.enabled = isMuted; });
     setIsMuted(m => !m);
   };
 
   const toggleVideo = () => {
-    streamRef.current?.getVideoTracks().forEach(t => t.enabled = isVideoOff);
+    streamRef.current?.getVideoTracks().forEach(t => { t.enabled = isVideoOff; });
     setIsVideoOff(v => !v);
   };
 
+  // ── UI ───────────────────────────────────────────────────────
   return (
     <main style={{ paddingTop: "56px", minHeight: "100vh" }}>
       <div style={{ maxWidth: "900px", margin: "0 auto", padding: "4rem 2rem" }}>
@@ -147,17 +205,17 @@ export default function VideoPage() {
           <div className="video-frame">
             <video ref={localRef} autoPlay muted playsInline style={{ transform: "scaleX(-1)" }} />
             {callState === "idle" && (
-              <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:"0.5rem" }}>
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <span style={{ fontSize: "0.72rem", letterSpacing: "0.15em", color: "var(--muted)", textTransform: "uppercase" }}>Your camera</span>
               </div>
             )}
-            <span style={{ position:"absolute", bottom:"10px", left:"12px", fontSize:"0.6rem", letterSpacing:"0.12em", color:"var(--muted)", textTransform:"uppercase" }}>You</span>
+            <span style={{ position: "absolute", bottom: "10px", left: "12px", fontSize: "0.6rem", letterSpacing: "0.12em", color: "var(--muted)", textTransform: "uppercase" }}>You</span>
           </div>
 
           <div className="video-frame">
             <video ref={remoteRef} autoPlay playsInline />
             {callState !== "connected" && (
-              <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <span style={{
                   fontSize: "0.72rem", letterSpacing: "0.15em", color: "var(--muted)", textTransform: "uppercase",
                   animation: callState === "calling" ? "blink 1.4s ease infinite" : "none"
@@ -166,7 +224,7 @@ export default function VideoPage() {
                 </span>
               </div>
             )}
-            <span style={{ position:"absolute", bottom:"10px", left:"12px", fontSize:"0.6rem", letterSpacing:"0.12em", color:"var(--muted)", textTransform:"uppercase" }}>Remote</span>
+            <span style={{ position: "absolute", bottom: "10px", left: "12px", fontSize: "0.6rem", letterSpacing: "0.12em", color: "var(--muted)", textTransform: "uppercase" }}>Remote</span>
           </div>
         </div>
 
@@ -194,7 +252,7 @@ export default function VideoPage() {
                 maxLength={8}
               />
               <button className="btn-ghost" style={{ whiteSpace: "nowrap", padding: "0.7rem 1.1rem" }}
-                onClick={() => setInputId(Math.random().toString(36).substring(2,8).toUpperCase())}
+                onClick={() => setInputId(Math.random().toString(36).substring(2, 8).toUpperCase())}
               >
                 Random
               </button>
@@ -247,11 +305,8 @@ export default function VideoPage() {
           )}
         </div>
 
-        {/* Note */}
-        <div style={{
-          marginTop: "4rem", paddingTop: "2rem",
-          borderTop: "1px solid var(--border)"
-        }}>
+        {/* How it works */}
+        <div style={{ marginTop: "4rem", paddingTop: "2rem", borderTop: "1px solid var(--border)" }}>
           <p style={{ fontSize: "0.72rem", letterSpacing: "0.18em", color: "var(--muted)", textTransform: "uppercase", marginBottom: "1.5rem" }}>
             How it works
           </p>
@@ -260,7 +315,7 @@ export default function VideoPage() {
               { n: "01", t: "Enable camera" },
               { n: "02", t: "Enter or generate a room ID" },
               { n: "03", t: "Share the ID with another person" },
-              { n: "04", t: "Both join the same room" },
+              { n: "04", t: "Both join — connected instantly" },
             ].map(({ n, t }) => (
               <div key={n} style={{ display: "flex", gap: "1rem", alignItems: "baseline" }}>
                 <span style={{ fontFamily: "var(--serif)", fontSize: "1.1rem", color: "var(--border)", minWidth: "28px" }}>{n}</span>
@@ -269,7 +324,7 @@ export default function VideoPage() {
             ))}
           </div>
           <p style={{ marginTop: "1.5rem", fontSize: "0.75rem", fontWeight: 300, color: "rgba(232,233,236,0.2)", lineHeight: 1.7 }}>
-            Same-browser tabs connect via BroadcastChannel. Cross-device calls require a WebSocket signaling server.
+            Signaling via Socket.IO · Video streamed peer-to-peer via WebRTC · No video passes through the server
           </p>
         </div>
 
