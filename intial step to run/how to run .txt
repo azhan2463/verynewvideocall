@@ -1,0 +1,9 @@
+# Extract karo, phir:
+cd silenttalk
+npm install
+npm run dev
+
+# Alag terminal mein:
+cd silenttalk/backend
+pip install flask flask-cors
+python app.py
