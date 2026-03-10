@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-RUN ./node_modules/.bin/vite build
+RUN npm run build
 
 # ── Stage 2: run the Python backend ──
 FROM python:3.11-slim
