@@ -1,13 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { io } from "socket.io-client";
 
-// ── Point this at your deployed backend (or localhost for dev) ──
 const BACKEND = import.meta.env.DEV ? "http://localhost:5000" : window.location.origin;
 
 export default function VideoPage() {
   const [inputId, setInputId]       = useState("");
   const [roomId, setRoomId]         = useState("");
-  const [callState, setCallState]   = useState("idle"); // idle | setup | calling | connected | ended
+  const [callState, setCallState]   = useState("idle");
   const [isMuted, setIsMuted]       = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [statusMsg, setStatusMsg]   = useState("");
@@ -18,31 +17,23 @@ export default function VideoPage() {
   const streamRef  = useRef(null);
   const socketRef  = useRef(null);
   const roomRef    = useRef("");
+  const isHostRef  = useRef(false); // true = created the offer
 
-  // Cleanup everything on unmount
   useEffect(() => () => cleanup(), []);
 
   const cleanup = () => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
-
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-
+    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (socketRef.current) {
-      if (roomRef.current) {
-        socketRef.current.emit("leave", { room: roomRef.current });
-      }
+      if (roomRef.current) socketRef.current.emit("leave", { room: roomRef.current });
       socketRef.current.disconnect();
       socketRef.current = null;
     }
-
     roomRef.current = "";
+    isHostRef.current = false;
   };
 
-  // ── Step 1: turn on camera ──────────────────────────────────
   const enableCamera = async () => {
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -55,45 +46,50 @@ export default function VideoPage() {
     }
   };
 
-  // ── Create RTCPeerConnection ────────────────────────────────
-  const createPC = useCallback((socket, room) => {
+  const makePC = (socket, room) => {
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "turn:openrelay.metered.ca:80",        username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443",       username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
       ],
     });
 
-    // Attach local tracks
-    streamRef.current?.getTracks().forEach(t => pc.addTrack(t, streamRef.current));
+    // Add all local tracks BEFORE creating offer/answer
+    streamRef.current.getTracks().forEach(track => {
+      pc.addTrack(track, streamRef.current);
+    });
 
-    // Send ICE candidates to peer via server
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        socket.emit("signal", { room, type: "candidate", candidate });
-      }
+      if (candidate) socket.emit("signal", { room, type: "candidate", candidate });
     };
 
-    // Show remote video when tracks arrive
-    pc.ontrack = ({ streams }) => {
-      if (remoteRef.current && streams[0]) {
-        remoteRef.current.srcObject = streams[0];
+    pc.ontrack = (e) => {
+      console.log("ontrack fired", e.streams);
+      if (remoteRef.current && e.streams[0]) {
+        remoteRef.current.srcObject = e.streams[0];
         setCallState("connected");
         setStatusMsg("Connected.");
       }
     };
 
-    pc.oniceconnectionstatechange = () => {
-      if (["disconnected", "failed"].includes(pc.iceConnectionState)) {
+    pc.onconnectionstatechange = () => {
+      console.log("connectionState:", pc.connectionState);
+      if (pc.connectionState === "connected") {
+        setCallState("connected");
+        setStatusMsg("Connected.");
+      }
+      if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
         setStatusMsg("Connection lost.");
         setCallState("ended");
       }
     };
 
     return pc;
-  }, []);
+  };
 
-  // ── Step 2: join room ───────────────────────────────────────
   const joinRoom = async () => {
     const id = inputId.trim().toUpperCase();
     if (!id) { setStatusMsg("Please enter a room ID."); return; }
@@ -103,71 +99,64 @@ export default function VideoPage() {
     setCallState("calling");
     setStatusMsg(`Joining room ${id}…`);
 
-    // Connect socket
     const socket = io(BACKEND, { transports: ["websocket"] });
     socketRef.current = socket;
-
-    socket.on("connect", () => {
-      socket.emit("join", { room: id });
-    });
 
     socket.on("connect_error", () => {
       setStatusMsg("Cannot reach signaling server. Is the backend running?");
       setCallState("ended");
     });
 
-    // ── Signaling message handler ──
-    socket.on("signal", async (m) => {
-      const pc = pcRef.current;
-      if (!pc || !m) return;
+    // ── Someone else is already in the room → we are the GUEST → wait for offer
+    // ── We are first in the room → we are the HOST → wait for peer-joined then send offer
 
+    socket.on("peer-joined", async () => {
+      // We were already in the room, new person joined → WE send the offer
+      console.log("peer-joined: I am host, creating offer");
+      isHostRef.current = true;
+      const pc = makePC(socket, id);
+      pcRef.current = pc;
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit("signal", { room: id, type: "offer", sdp: offer.sdp });
+      setStatusMsg("Peer joined — connecting…");
+    });
+
+    socket.on("signal", async (m) => {
+      console.log("signal received:", m.type);
+
+      // Guest receives offer → create answer
       if (m.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(m));
+        const pc = makePC(socket, id);
+        pcRef.current = pc;
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: m.sdp }));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit("signal", { room: id, ...answer });
-        setCallState("connected");
-        setStatusMsg("Connected.");
+        socket.emit("signal", { room: id, type: "answer", sdp: answer.sdp });
       }
 
-      if (m.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(m));
-        setCallState("connected");
-        setStatusMsg("Connected.");
+      // Host receives answer
+      if (m.type === "answer" && pcRef.current) {
+        await pcRef.current.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: m.sdp }));
       }
 
-      if (m.type === "candidate") {
-        try { await pc.addIceCandidate(new RTCIceCandidate(m.candidate)); } catch {}
+      // Both sides add ICE candidates
+      if (m.type === "candidate" && pcRef.current) {
+        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(m.candidate)); } catch(e) { console.warn(e); }
       }
     });
 
-    // Peer left
     socket.on("peer-left", () => {
       setStatusMsg("The other participant left.");
       setCallState("ended");
     });
 
-    // ── If a peer is already in the room, server fires "peer-joined" back
-    //    to the *existing* peer. We are the newcomer, so we wait for an offer.
-    //    The existing peer sends us an offer when they see "peer-joined".
-    socket.on("peer-joined", async () => {
-      // We are the host — create offer for the new joiner
-      const pc = createPC(socket, id);
-      pcRef.current = pc;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("signal", { room: id, ...offer });
-      setStatusMsg(`Room ${id} — peer joined, connecting…`);
-    });
-
-    // Create PC now (as potential answerer)
-    const pc = createPC(socket, id);
-    pcRef.current = pc;
-
+    // Join the room — server will fire "peer-joined" to whoever was already there
+    socket.emit("join", { room: id });
     setStatusMsg(`Room ${id} — waiting for someone to join…`);
   };
 
-  // ── Hang up ─────────────────────────────────────────────────
   const hangUp = () => {
     cleanup();
     setCallState("idle");
@@ -185,12 +174,10 @@ export default function VideoPage() {
     setIsVideoOff(v => !v);
   };
 
-  // ── UI ───────────────────────────────────────────────────────
   return (
     <main style={{ paddingTop: "56px", minHeight: "100vh" }}>
       <div style={{ maxWidth: "900px", margin: "0 auto", padding: "4rem 2rem" }}>
 
-        {/* Header */}
         <div className="fu" style={{ marginBottom: "3rem" }}>
           <p style={{ fontSize: "0.72rem", letterSpacing: "0.18em", color: "var(--muted)", textTransform: "uppercase", marginBottom: "0.75rem" }}>
             WebRTC · Peer to peer
@@ -200,7 +187,6 @@ export default function VideoPage() {
           </h1>
         </div>
 
-        {/* Video grid */}
         <div className="fu2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", marginBottom: "2rem" }}>
           <div className="video-frame">
             <video ref={localRef} autoPlay muted playsInline style={{ transform: "scaleX(-1)" }} />
@@ -228,7 +214,6 @@ export default function VideoPage() {
           </div>
         </div>
 
-        {/* Status */}
         {statusMsg && (
           <p className="fu3" style={{
             fontSize: "0.8rem", fontWeight: 300,
@@ -239,62 +224,37 @@ export default function VideoPage() {
           </p>
         )}
 
-        {/* Controls */}
         <div className="fu4" style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-
           {(callState === "idle" || callState === "setup") && (
             <div style={{ display: "flex", gap: "0.75rem", maxWidth: "420px" }}>
               <input
-                className="input"
-                placeholder="Room ID"
-                value={inputId}
-                onChange={e => setInputId(e.target.value.toUpperCase())}
-                maxLength={8}
+                className="input" placeholder="Room ID"
+                value={inputId} onChange={e => setInputId(e.target.value.toUpperCase())} maxLength={8}
               />
               <button className="btn-ghost" style={{ whiteSpace: "nowrap", padding: "0.7rem 1.1rem" }}
-                onClick={() => setInputId(Math.random().toString(36).substring(2, 8).toUpperCase())}
-              >
+                onClick={() => setInputId(Math.random().toString(36).substring(2, 8).toUpperCase())}>
                 Random
               </button>
             </div>
           )}
 
           <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
-            {callState === "idle" && (
-              <button className="btn-primary" onClick={enableCamera}>Enable camera</button>
-            )}
-            {callState === "setup" && (
-              <button className="btn-primary" onClick={joinRoom}>Join room</button>
-            )}
+            {callState === "idle" && <button className="btn-primary" onClick={enableCamera}>Enable camera</button>}
+            {callState === "setup" && <button className="btn-primary" onClick={joinRoom}>Join room</button>}
             {(callState === "calling" || callState === "connected") && (
               <>
-                <button className="btn-ghost" onClick={toggleMute} style={{
-                  padding: "0.7rem 1.2rem",
-                  color: isMuted ? "rgba(240,180,120,0.8)" : "var(--muted)",
-                  borderColor: isMuted ? "rgba(240,180,120,0.3)" : "var(--border)"
-                }}>
+                <button className="btn-ghost" onClick={toggleMute} style={{ padding: "0.7rem 1.2rem", color: isMuted ? "rgba(240,180,120,0.8)" : "var(--muted)", borderColor: isMuted ? "rgba(240,180,120,0.3)" : "var(--border)" }}>
                   {isMuted ? "Unmute" : "Mute"}
                 </button>
-                <button className="btn-ghost" onClick={toggleVideo} style={{
-                  padding: "0.7rem 1.2rem",
-                  color: isVideoOff ? "rgba(240,180,120,0.8)" : "var(--muted)",
-                  borderColor: isVideoOff ? "rgba(240,180,120,0.3)" : "var(--border)"
-                }}>
+                <button className="btn-ghost" onClick={toggleVideo} style={{ padding: "0.7rem 1.2rem", color: isVideoOff ? "rgba(240,180,120,0.8)" : "var(--muted)", borderColor: isVideoOff ? "rgba(240,180,120,0.3)" : "var(--border)" }}>
                   {isVideoOff ? "Show video" : "Hide video"}
                 </button>
-                <button onClick={hangUp} style={{
-                  fontFamily: "var(--sans)", fontSize: "0.82rem", fontWeight: 400,
-                  padding: "0.7rem 1.5rem", borderRadius: "8px", cursor: "pointer",
-                  background: "rgba(240,80,80,0.1)", border: "1px solid rgba(240,80,80,0.25)",
-                  color: "rgba(240,140,140,0.9)", transition: "all 0.18s"
-                }}>
+                <button onClick={hangUp} style={{ fontFamily: "var(--sans)", fontSize: "0.82rem", fontWeight: 400, padding: "0.7rem 1.5rem", borderRadius: "8px", cursor: "pointer", background: "rgba(240,80,80,0.1)", border: "1px solid rgba(240,80,80,0.25)", color: "rgba(240,140,140,0.9)" }}>
                   End call
                 </button>
               </>
             )}
-            {callState === "ended" && (
-              <button className="btn-ghost" onClick={hangUp}>New call</button>
-            )}
+            {callState === "ended" && <button className="btn-ghost" onClick={hangUp}>New call</button>}
           </div>
 
           {roomId && (
@@ -305,11 +265,8 @@ export default function VideoPage() {
           )}
         </div>
 
-        {/* How it works */}
         <div style={{ marginTop: "4rem", paddingTop: "2rem", borderTop: "1px solid var(--border)" }}>
-          <p style={{ fontSize: "0.72rem", letterSpacing: "0.18em", color: "var(--muted)", textTransform: "uppercase", marginBottom: "1.5rem" }}>
-            How it works
-          </p>
+          <p style={{ fontSize: "0.72rem", letterSpacing: "0.18em", color: "var(--muted)", textTransform: "uppercase", marginBottom: "1.5rem" }}>How it works</p>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "1.5rem" }}>
             {[
               { n: "01", t: "Enable camera" },
