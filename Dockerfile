@@ -12,7 +12,9 @@ WORKDIR /app
 
 COPY --from=frontend /app/dist ./dist
 COPY backend/ ./backend/
-RUN pip install --no-cache-dir flask flask-cors flask-socketio eventlet
+
+# ✅ FIXED LINE (added requests)
+RUN pip install --no-cache-dir flask flask-cors flask-socketio eventlet requests
 
 EXPOSE 5000
 CMD ["python", "backend/app.py"]
